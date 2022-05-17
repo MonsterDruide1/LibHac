@@ -47,7 +47,7 @@ public static class MountUtility
             return Result.Success;
         }
 
-        for (int i = 0; i <= maxMountLen; i++)
+        for (int i = 0; i < maxMountLen; i++)
         {
             if (path[i] == DriveSeparator)
             {
