@@ -16,7 +16,7 @@ using IStorage = LibHac.FsSrv.Sf.IStorage;
 
 namespace LibHac.GcSrv;
 
-public class GameCardManager : IStorageDeviceManager, IStorageDeviceOperator, IGameCardDeviceManager
+public class GameCardManager : IStorageDeviceManager, IStorageDeviceOperator, IGameCardManager, IGameCardKeyManager
 {
     private enum CardState
     {
@@ -64,7 +64,7 @@ public class GameCardManager : IStorageDeviceManager, IStorageDeviceOperator, IG
         _rwLock = null;
     }
 
-    private uint BytesToPages(long byteCount)
+    public static uint BytesToPages(long byteCount)
     {
         return (uint)((ulong)byteCount / (ulong)Values.GcPageSize);
     }
@@ -320,15 +320,50 @@ public class GameCardManager : IStorageDeviceManager, IStorageDeviceOperator, IG
 
     public Result OpenOperator(ref SharedRef<IStorageDeviceOperator> outDeviceOperator)
     {
-        throw new NotImplementedException();
+        Result rc = InitializeGcLibrary();
+        if (rc.IsFailure()) return rc.Miss();
+
+        using SharedRef<GameCardManager> deviceOperator = SharedRef<GameCardManager>.Create(in _selfReference);
+
+        if (!deviceOperator.HasValue)
+            return ResultFs.AllocationMemoryFailedInGameCardManagerG.Log();
+
+        outDeviceOperator.SetByMove(ref deviceOperator.Ref());
+
+        return Result.Success;
     }
 
     public Result OpenDevice(ref SharedRef<IStorageDevice> outStorageDevice, ulong attribute)
     {
-        throw new NotImplementedException();
+        Result rc = InitializeGcLibrary();
+        if (rc.IsFailure()) return rc.Miss();
+
+        using var storageDevice = new SharedRef<IStorageDevice>();
+
+        rc = OpenDeviceImpl(ref storageDevice.Ref(), (OpenGameCardAttribute)attribute);
+        if (rc.IsFailure()) return rc.Miss();
+
+        outStorageDevice.SetByMove(ref storageDevice.Ref());
+
+        return Result.Success;
     }
 
     public Result OpenStorage(ref SharedRef<IStorage> outStorage, ulong attribute)
+    {
+        Result rc = InitializeGcLibrary();
+        if (rc.IsFailure()) return rc.Miss();
+
+        using var storageDevice = new SharedRef<IStorageDevice>();
+
+        rc = OpenDeviceImpl(ref storageDevice.Ref(), (OpenGameCardAttribute)attribute);
+        if (rc.IsFailure()) return rc.Miss();
+
+        outStorage.SetByMove(ref storageDevice.Ref());
+
+        return Result.Success;
+    }
+
+    private Result OpenDeviceImpl(ref SharedRef<IStorageDevice> outStorageDevice, OpenGameCardAttribute attribute)
     {
         throw new NotImplementedException();
     }
@@ -893,5 +928,10 @@ public class GameCardManager : IStorageDeviceManager, IStorageDeviceOperator, IG
     public bool IsSecureMode()
     {
         return _state == CardState.Secure;
+    }
+
+    public void PresetInternalKeys(ReadOnlySpan<byte> gameCardKey, ReadOnlySpan<byte> gameCardCertificate)
+    {
+        throw new NotImplementedException();
     }
 }
