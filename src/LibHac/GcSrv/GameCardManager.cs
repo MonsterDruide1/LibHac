@@ -14,7 +14,8 @@ using LibHac.Os;
 using LibHac.Sf;
 using static LibHac.Gc.Values;
 using static LibHac.GcSrv.GameCardDeviceOperator;
-using IStorage = LibHac.FsSrv.Sf.IStorage;
+using IStorage = LibHac.Fs.IStorage;
+using IStorageSf = LibHac.FsSrv.Sf.IStorage;
 
 namespace LibHac.GcSrv;
 
@@ -124,7 +125,7 @@ public class GameCardManager : IStorageDeviceManager, IStorageDeviceOperator, IG
         return Result.Success;
     }
 
-    public Result InitializeGcLibrary()
+    private Result InitializeGcLibrary()
     {
         using var writeLock = new UniqueLock<ReaderWriterLock>(_rwLock);
 
@@ -139,7 +140,7 @@ public class GameCardManager : IStorageDeviceManager, IStorageDeviceOperator, IG
         _gc.Initialize(default, default);
         // Missing: Register the device buffer
 
-        _detectionEventManager = new GameCardDetectionEventManager();
+        _detectionEventManager = new GameCardDetectionEventManager(_gc);
         _isInitialized = true;
 
         return Result.Success;
@@ -358,7 +359,7 @@ public class GameCardManager : IStorageDeviceManager, IStorageDeviceOperator, IG
         return Result.Success;
     }
 
-    public Result OpenStorage(ref SharedRef<IStorage> outStorage, ulong attribute)
+    public Result OpenStorage(ref SharedRef<IStorageSf> outStorage, ulong attribute)
     {
         Result rc = InitializeGcLibrary();
         if (rc.IsFailure()) return rc.Miss();
@@ -375,7 +376,208 @@ public class GameCardManager : IStorageDeviceManager, IStorageDeviceOperator, IG
 
     private Result OpenDeviceImpl(ref SharedRef<IStorageDevice> outStorageDevice, OpenGameCardAttribute attribute)
     {
-        throw new NotImplementedException();
+        Result rc;
+        using var writeLock = new UniqueLock<ReaderWriterLock>(_rwLock);
+
+        using var storageDevice = new SharedRef<IStorageDevice>();
+        using var baseStorage = new SharedRef<IStorage>();
+
+        switch (attribute)
+        {
+            case OpenGameCardAttribute.ReadOnly:
+                rc = OpenDeviceReadOnly(ref baseStorage.Ref(), ref storageDevice.Ref());
+                if (rc.IsFailure()) return rc.Miss();
+                break;
+            case OpenGameCardAttribute.SecureReadOnly:
+                rc = OpenDeviceSecureReadOnly(ref baseStorage.Ref(), ref storageDevice.Ref());
+                if (rc.IsFailure()) return rc.Miss();
+                break;
+            case OpenGameCardAttribute.WriteOnly:
+                rc = OpenDeviceWriteOnly(ref baseStorage.Ref(), ref storageDevice.Ref());
+                if (rc.IsFailure()) return rc.Miss();
+                break;
+            default:
+                return ResultFs.InvalidArgument.Log();
+        }
+
+        outStorageDevice.SetByMove(ref storageDevice.Ref());
+
+        return Result.Success;
+    }
+
+    private Result OpenDeviceReadOnly(ref SharedRef<IStorage> outStorage,
+        ref SharedRef<IStorageDevice> outStorageDevice)
+    {
+        Result rc = EnsureGameCardNormalMode(out GameCardHandle handle);
+        if (rc.IsFailure()) return rc.Miss();
+
+        rc = CreateReadOnlyStorage(ref outStorage);
+        if (rc.IsFailure()) return rc.Miss();
+
+        if (!outStorage.HasValue)
+            return ResultFs.AllocationMemoryFailedInGameCardManagerB.Log();
+
+        using SharedRef<IStorageDevice> storageDevice = CreateStorageDeviceNonSecure(in outStorage, handle);
+        if (!storageDevice.HasValue)
+            return ResultFs.AllocationMemoryFailedInGameCardManagerB.Log();
+
+        outStorageDevice.SetByMove(ref storageDevice.Ref());
+
+        return Result.Success;
+    }
+
+    private Result OpenDeviceSecureReadOnly(ref SharedRef<IStorage> outStorage,
+        ref SharedRef<IStorageDevice> outStorageDevice)
+    {
+        Result rc = EnsureGameCardSecureMode(out GameCardHandle handle);
+        if (rc.IsFailure()) return rc.Miss();
+
+        Span<byte> currentCardDeviceId = stackalloc byte[GcCardDeviceIdSize];
+        Span<byte> currentCardImageHash = stackalloc byte[GcCardImageHashSize];
+
+        rc = HandleGameCardAccessResult(_gc.GetCardDeviceId(currentCardDeviceId));
+        if (rc.IsFailure()) return rc.Miss();
+
+        rc = HandleGameCardAccessResult(_gc.GetCardImageHash(currentCardImageHash));
+        if (rc.IsFailure()) return rc.Miss();
+
+        rc = CreateSecureReadOnlyStorage(ref outStorage);
+        if (rc.IsFailure()) return rc.Miss();
+
+        if (!outStorage.HasValue)
+            return ResultFs.AllocationMemoryFailedInGameCardManagerC.Log();
+
+        using SharedRef<IStorageDevice> storageDevice =
+            CreateStorageDeviceSecure(in outStorage, handle, currentCardDeviceId, currentCardImageHash);
+
+        if (!storageDevice.HasValue)
+            return ResultFs.AllocationMemoryFailedInGameCardManagerD.Log();
+
+        outStorageDevice.SetByMove(ref storageDevice.Ref());
+
+        return Result.Success;
+    }
+
+    private Result OpenDeviceWriteOnly(ref SharedRef<IStorage> outStorage,
+        ref SharedRef<IStorageDevice> outStorageDevice)
+    {
+        Result rc = EnsureGameCardWriteMode(out GameCardHandle handle);
+        if (rc.IsFailure()) return rc.Miss();
+
+        rc = CreateWriteOnlyStorage(ref outStorage);
+        if (rc.IsFailure()) return rc.Miss();
+
+        if (!outStorage.HasValue)
+            return ResultFs.AllocationMemoryFailedInGameCardManagerE.Log();
+
+        using SharedRef<IStorageDevice> storageDevice = CreateStorageDeviceNonSecure(in outStorage, handle);
+        if (!storageDevice.HasValue)
+            return ResultFs.AllocationMemoryFailedInGameCardManagerF.Log();
+
+        outStorageDevice.SetByMove(ref storageDevice.Ref());
+
+        return Result.Success;
+    }
+
+    private class DelegatedSubStorage : SubStorage
+    {
+        private SharedRef<IStorage> _baseStorageShared;
+
+        public DelegatedSubStorage(ref UniqueRef<IStorage> baseStorage, long offset, long size)
+            : base(baseStorage.Get, offset, size)
+        {
+            _baseStorageShared = SharedRef<IStorage>.Create(ref baseStorage);
+        }
+
+        public override void Dispose()
+        {
+            _baseStorageShared.Destroy();
+
+            base.Dispose();
+        }
+    }
+
+    private Result CreateReadOnlyStorage(ref SharedRef<IStorage> outStorage)
+    {
+        using var storage = new UniqueRef<IStorage>(MakeReadOnlyGameCardStorage());
+        if (!storage.HasValue)
+            return ResultFs.AllocationMemoryFailedInGameCardManagerA.Log();
+
+        Result rc = HandleGameCardAccessResult(_gc.GetCardStatus(out GameCardStatus cardStatus));
+        if (rc.IsFailure()) return rc.Miss();
+
+        long size = cardStatus.SecureAreaOffset;
+
+        outStorage.Reset(new DelegatedSubStorage(ref storage.Ref(), 0, size));
+
+        return Result.Success;
+    }
+
+    private Result CreateSecureReadOnlyStorage(ref SharedRef<IStorage> outStorage)
+    {
+        using var storage = new UniqueRef<IStorage>(MakeReadOnlyGameCardStorage());
+        if (!storage.HasValue)
+            return ResultFs.AllocationMemoryFailedInGameCardManagerC.Log();
+
+        Result rc = HandleGameCardAccessResult(_gc.GetCardStatus(out GameCardStatus cardStatus));
+        if (rc.IsFailure()) return rc.Miss();
+
+        long offset = cardStatus.SecureAreaOffset;
+        long size = cardStatus.SecureAreaSize;
+
+        outStorage.Reset(new DelegatedSubStorage(ref storage.Ref(), offset, size));
+
+        return Result.Success;
+    }
+
+    private Result CreateWriteOnlyStorage(ref SharedRef<IStorage> outStorage)
+    {
+        using var storage = new UniqueRef<IStorage>(MakeWriteOnlyGameCardStorage());
+        if (!storage.HasValue)
+            return ResultFs.AllocationMemoryFailedInGameCardManagerE.Log();
+
+        Result rc = storage.Get.GetSize(out long size);
+        if (rc.IsFailure()) return rc.Miss();
+
+        outStorage.Reset(new DelegatedSubStorage(ref storage.Ref(), 0, size));
+
+        return Result.Success;
+    }
+
+    private ReadOnlyGameCardStorage MakeReadOnlyGameCardStorage()
+    {
+        using SharedRef<IGameCardManager> manager = SharedRef<IGameCardManager>.Create(in _selfReference);
+
+        return new ReadOnlyGameCardStorage(ref manager.Ref(), _gc);
+    }
+
+    private WriteOnlyGameCardStorage MakeWriteOnlyGameCardStorage()
+    {
+        using SharedRef<IGameCardManager> manager = SharedRef<IGameCardManager>.Create(in _selfReference);
+
+        return new WriteOnlyGameCardStorage(ref manager.Ref(), _gc);
+    }
+
+    private SharedRef<IStorageDevice> CreateStorageDeviceNonSecure(in SharedRef<IStorage> baseStorage,
+        GameCardHandle handle)
+    {
+        using SharedRef<IGameCardManager> manager = SharedRef<IGameCardManager>.Create(in _selfReference);
+
+        using SharedRef<GameCardStorageDevice> storageDevice =
+            GameCardStorageDevice.CreateShared(_gc, ref manager.Ref(), in baseStorage, handle);
+
+        return SharedRef<IStorageDevice>.CreateMove(ref storageDevice.Ref());
+    }
+
+    private SharedRef<IStorageDevice> CreateStorageDeviceSecure(in SharedRef<IStorage> baseStorage,
+        GameCardHandle handle, ReadOnlySpan<byte> cardDeviceId, ReadOnlySpan<byte> cardImageHash)
+    {
+        using SharedRef<IGameCardManager> manager = SharedRef<IGameCardManager>.Create(in _selfReference);
+
+        using SharedRef<GameCardStorageDevice> storageDevice = GameCardStorageDevice.CreateShared(
+            _gc, ref manager.Ref(), in baseStorage, handle, isSecure: true, cardDeviceId, cardImageHash);
+
+        return SharedRef<IStorageDevice>.CreateMove(ref storageDevice.Ref());
     }
 
     public Result PutToSleep()
@@ -956,6 +1158,27 @@ public class GameCardManager : IStorageDeviceManager, IStorageDeviceOperator, IG
 
     public void PresetInternalKeys(ReadOnlySpan<byte> gameCardKey, ReadOnlySpan<byte> gameCardCertificate)
     {
-        throw new NotImplementedException();
+        if (gameCardKey.IsEmpty || gameCardCertificate.IsEmpty)
+        {
+            ReadOnlySpan<byte> message = // "[fs] Warning: skipped nn::gc::PresetInternalKeys\n"
+                new[]
+                {
+                    (byte)'[', (byte)'f', (byte)'s', (byte)']', (byte)' ', (byte)'W', (byte)'a', (byte)'r',
+                    (byte)'n', (byte)'i', (byte)'n', (byte)'g', (byte)':', (byte)' ', (byte)'s', (byte)'k',
+                    (byte)'i', (byte)'p', (byte)'p', (byte)'e', (byte)'d', (byte)' ', (byte)'n', (byte)'n',
+                    (byte)':', (byte)':', (byte)'g', (byte)'c', (byte)':', (byte)':', (byte)'P', (byte)'r',
+                    (byte)'e', (byte)'s', (byte)'e', (byte)'t', (byte)'I', (byte)'n', (byte)'t', (byte)'e',
+                    (byte)'r', (byte)'n', (byte)'a', (byte)'l', (byte)'K', (byte)'e', (byte)'y', (byte)'s',
+                    (byte)'\n'
+                };
+
+            _fsServer.Hos.Diag.Impl.LogImpl(Log.EmptyModuleName, LogSeverity.Info, message);
+        }
+        else
+        {
+            _gc.PresetInternalKeys(gameCardKey, gameCardCertificate);
+        }
+
+        // Missing: Signal settings-ready event
     }
 }

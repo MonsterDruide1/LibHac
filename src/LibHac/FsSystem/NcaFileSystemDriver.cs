@@ -87,6 +87,7 @@ public enum KeyType
 
 public class NcaFileSystemDriver : IDisposable
 {
+    [NonCopyable]
     public struct StorageContext : IDisposable
     {
         public bool OpenRawStorage;
