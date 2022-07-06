@@ -291,6 +291,7 @@ public class FileSystemInterfaceAdapter : IFileSystemSf
     public void Dispose()
     {
         _baseFileSystem.Destroy();
+        _selfReference.Destroy();
     }
 
     private static ReadOnlySpan<byte> RootDir => new[] { (byte)'/' };
