@@ -58,6 +58,8 @@ NCA options:
   --basetitlekey       Specify single (encrypted) titlekey for the base NCA.
   --titlekey           Specify single (encrypted) titlekey.
   --suppresskeys       Suppress output of decrypted keys.
+NPDM options:
+  --json <file>        Specify file path for saving JSON representation of program permissions to.
 KIP1 options:
   --uncompressed <f>   Specify file path for saving uncompressed KIP1.
 RomFS options:
